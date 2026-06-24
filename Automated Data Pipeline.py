@@ -1,660 +1,873 @@
-import requests
+"""
+Portfolio Sample: Anonymized KoboToolbox-to-MySQL ETL Pipeline
+Author: Osama Shabbar
+
+Purpose
+-------
+This script demonstrates an ETL workflow for humanitarian programme monitoring data:
+1. Extract records from multiple KoboToolbox forms through API calls.
+2. Standardize and harmonize inconsistent field structures across forms.
+3. Apply data quality checks, deduplication, date parsing, and numeric conversions.
+4. Protect sensitive fields through hashing and location approximation.
+5. Load cleaned analytical tables into MySQL using batch upserts.
+
+Confidentiality Note
+--------------------
+This is a portfolio-safe, anonymized version. Organization names, project IDs,
+beneficiary identifiers, exact locations, personal details, and internal field names
+have been removed or replaced with generic placeholders.
+
+Before production use, replace the generic source-column names in the mapping lists
+with the approved field names from your actual data collection tools.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
 import pandas as pd
 import pymysql
-import numpy as np
-from concurrent.futures import ThreadPoolExecutor
-import warnings
-warnings.filterwarnings('ignore')
-
-# MySQL connection
-MYSQL_HOST = 'host'
-MYSQL_USER = 'username'
-MYSQL_PASSWORD = 'password'  
-MYSQL_DB = 'database'
-
-# API Configuration
-API_TOKEN = "API_Token"
-BASE_URL = "API_URL"
-PROJECT_UID_1 = "Project_UID_1"
-PROJECT_UID_2 = "Project_UID_2"
-PROJECT_UID_3 = "Project_UID_3"
+import requests
 
 
-def fetch_kobo_data(asset_uid):
-    """Fetch data from Kobo API"""
-    headers = {"Authorization": f"Token {API_TOKEN}"}
-    url = f"{BASE_URL}{asset_uid}/data.json"
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+
+REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))
+ANONYMIZE_GEOLOCATION = os.getenv("ANONYMIZE_GEOLOCATION", "true").lower() == "true"
+LOAD_TO_MYSQL = os.getenv("LOAD_TO_MYSQL", "true").lower() == "true"
+
+# Hash salt should be stored securely as an environment variable in production.
+# For portfolio/demo use, this fallback keeps the sample runnable but should not be
+# used for real personal data.
+HASH_SALT = os.getenv("HASH_SALT", "portfolio-demo-salt")
+
+
+class ConfigError(Exception):
+    """Raised when required configuration is missing."""
+
+
+def get_required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise ConfigError(f"Missing required environment variable: {name}")
+    return value
+
+
+def load_config() -> Dict[str, object]:
+    """Load configuration from environment variables.
+
+    Required environment variables:
+        KOBO_BASE_URL          Example: https://kf.kobotoolbox.org/api/v2/assets/
+        KOBO_API_TOKEN         Kobo API token
+        KOBO_PROJECT_UID_1     Kobo form asset UID for modality/source 1
+        KOBO_PROJECT_UID_2     Kobo form asset UID for modality/source 2
+        KOBO_PROJECT_UID_3     Kobo form asset UID for update/source 3
+
+    Required only when LOAD_TO_MYSQL=true:
+        MYSQL_HOST
+        MYSQL_USER
+        MYSQL_PASSWORD
+        MYSQL_DB
+    """
+
+    project_uids = [
+        os.getenv("KOBO_PROJECT_UID_1"),
+        os.getenv("KOBO_PROJECT_UID_2"),
+        os.getenv("KOBO_PROJECT_UID_3"),
+    ]
+    project_uids = [uid for uid in project_uids if uid]
+
+    if not project_uids:
+        raise ConfigError("At least one KOBO_PROJECT_UID_* environment variable is required.")
+
+    config: Dict[str, object] = {
+        "kobo_base_url": get_required_env("KOBO_BASE_URL").rstrip("/") + "/",
+        "kobo_api_token": get_required_env("KOBO_API_TOKEN"),
+        "project_uids": project_uids,
+    }
+
+    if LOAD_TO_MYSQL:
+        config.update(
+            {
+                "mysql_host": get_required_env("MYSQL_HOST"),
+                "mysql_user": get_required_env("MYSQL_USER"),
+                "mysql_password": get_required_env("MYSQL_PASSWORD"),
+                "mysql_db": get_required_env("MYSQL_DB"),
+            }
+        )
+
+    return config
+
+
+# -----------------------------------------------------------------------------
+# Anonymized source field mappings
+# -----------------------------------------------------------------------------
+# Replace these generic source-column names with approved, non-sensitive source
+# fields from your Kobo forms if you adapt the sample for another portfolio item.
+
+ADMIN_1_SOURCE_COLUMNS = [
+    "admin_1_option_a",
+    "admin_1_option_b",
+    "admin_1_option_c",
+    "admin_1_option_d",
+]
+
+ADMIN_2_SOURCE_COLUMNS = [
+    "admin_2_option_a",
+    "admin_2_option_b",
+    "admin_2_option_c",
+    "admin_2_option_d",
+    "admin_2_option_e",
+    "admin_2_option_f",
+]
+
+EXTERNAL_ID_MAPPINGS = [
+    (["external_id_scan_1", "external_id_manual_1", "national_id_hash_1"], "external_id_1_hash"),
+    (["external_id_scan_2", "external_id_manual_2", "national_id_hash_2"], "external_id_2_hash"),
+    (["external_id_scan_3", "external_id_manual_3", "national_id_hash_3"], "external_id_3_hash"),
+    (["external_id_scan_4", "external_id_manual_4", "national_id_hash_4"], "external_id_4_hash"),
+    (["external_id_scan_5", "external_id_manual_5", "national_id_hash_5"], "external_id_5_hash"),
+]
+
+PROFILE_SOURCE_COLUMNS = [
+    "case_id",
+    "submission_date",
+    "enumerator_id",
+    "participant_name_local",
+    "participant_name_english",
+    "contact_1",
+    "contact_2",
+    "external_id_1_hash",
+    "external_id_2_hash",
+    "external_id_3_hash",
+    "external_id_4_hash",
+    "external_id_5_hash",
+    "activity_type",
+    "nationality_group",
+    "admin_1",
+    "admin_2",
+    "admin_3",
+    "area_code",
+    "assistance_code",
+    "latitude_approx",
+    "longitude_approx",
+]
+
+SERVICE_PROVIDER_SOURCE_COLUMNS = [
+    "case_id",
+    "provider_name",
+    "provider_contact_1",
+    "provider_contact_2",
+    "provider_id",
+    "authorization_flag",
+    "proxy_name",
+    "proxy_contact_1",
+    "proxy_contact_2",
+    "proxy_id",
+    "submission_date",
+    "activity_type",
+    "assistance_code",
+]
+
+ASSISTANCE_SOURCE_COLUMNS = [
+    "case_id",
+    "signed_amount",
+    "household_members_reported",
+    "household_members_verified",
+    "assistance_duration_months",
+    "monthly_assistance_amount",
+    "total_assistance_amount",
+    "vulnerability_score",
+    "component_cost_a",
+    "component_cost_b",
+    "remaining_assistance_value",
+    "activity_type",
+    "submission_date",
+    "assistance_code",
+]
+
+AGREEMENT_STATUS_SOURCE_COLUMNS = [
+    "case_id",
+    "assistance_code",
+    "activity_type",
+    "enumerator_id",
+    "agreement_start_date",
+    "agreement_signed",
+    "payment_modality",
+    "proxy_present",
+    "proxy_name",
+    "proxy_contact_1",
+    "proxy_contact_2",
+    "proxy_id",
+    "submission_date",
+]
+
+CASE_CLOSURE_SOURCE_COLUMNS = [
+    "case_id",
+    "assistance_code",
+    "activity_type",
+    "enumerator_id",
+    "closure_reason_category",
+    "closure_notes",
+    "record_id",
+    "submission_date",
+]
+
+UPDATE_SOURCE_COLUMNS = [
+    "case_id",
+    "participant_name_local",
+    "participant_name_english",
+    "contact_1",
+    "contact_2",
+    "household_adult_male_count",
+    "household_adult_female_count",
+    "household_girl_count",
+    "household_boy_count",
+    "external_id_1",
+    "external_id_2",
+    "external_id_3",
+    "external_id_4",
+    "external_id_5",
+    "activity_type",
+    "submission_date",
+]
+
+
+# -----------------------------------------------------------------------------
+# Extraction
+# -----------------------------------------------------------------------------
+
+
+def fetch_kobo_records(asset_uid: str, config: Dict[str, object]) -> List[dict]:
+    """Fetch records from a KoboToolbox asset."""
+
+    headers = {"Authorization": f"Token {config['kobo_api_token']}"}
+    url = f"{config['kobo_base_url']}{asset_uid}/data.json"
+
     try:
-        response = requests.get(url, headers=headers, timeout=30)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"Error fetching data for {asset_uid}: {response.status_code}")
-            return None
-    except Exception as e:
-        print(f"Exception fetching {asset_uid}: {e}")
-        return None
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        payload = response.json()
+        records = payload.get("results", [])
+        logger.info("Fetched %s records from source %s", len(records), asset_uid)
+        return records
+    except requests.RequestException as exc:
+        logger.error("Failed to fetch source %s: %s", asset_uid, exc)
+        return []
 
 
-def merge_columns_vectorized(df, columns_list, new_column_name):
-    """Vectorized column merging"""
-    available_columns = [col for col in columns_list if col in df.columns]
-    if available_columns:
-        df[new_column_name] = df[available_columns].fillna('').astype(str).agg(' '.join, axis=1)
-        df[new_column_name] = df[new_column_name].str.strip()
-    else:
-        df[new_column_name] = ''
+def fetch_all_sources(config: Dict[str, object]) -> Dict[str, pd.DataFrame]:
+    """Fetch all configured Kobo sources in parallel."""
+
+    source_frames: Dict[str, pd.DataFrame] = {}
+    project_uids: List[str] = config["project_uids"]  # type: ignore[assignment]
+
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(project_uids))) as executor:
+        future_to_uid = {
+            executor.submit(fetch_kobo_records, uid, config): uid for uid in project_uids
+        }
+
+        for index, future in enumerate(as_completed(future_to_uid), start=1):
+            uid = future_to_uid[future]
+            records = future.result()
+            frame_name = f"source_{index}"
+            source_frames[frame_name] = normalize_dataframe(pd.DataFrame(records))
+            logger.info("Prepared dataframe %s from source UID %s", frame_name, uid)
+
+    return source_frames
+
+
+# -----------------------------------------------------------------------------
+# Transformation helpers
+# -----------------------------------------------------------------------------
+
+
+def standardize_column_name(column: str) -> str:
+    """Convert nested Kobo field names to simple snake_case names."""
+
+    column = str(column).split("/")[-1]
+    column = column.strip().replace(" ", "_").replace("-", "_")
+    return column.lower()
+
+
+def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize column names and return an empty dataframe safely."""
+
+    if df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    df.columns = [standardize_column_name(col) for col in df.columns]
     return df
 
 
-def merge_municipality_village(df, column_list, new_col):
-    """Merge municipality/village columns efficiently"""
-    available = [col for col in column_list if col in df.columns]
+def rename_if_present(df: pd.DataFrame, rename_map: Dict[str, str]) -> pd.DataFrame:
+    """Rename columns only when they exist in the dataframe."""
+
+    existing_map = {src: dst for src, dst in rename_map.items() if src in df.columns}
+    return df.rename(columns=existing_map)
+
+
+def merge_available_fields(
+    df: pd.DataFrame,
+    source_columns: Iterable[str],
+    target_column: str,
+    separator: str = " ",
+) -> pd.DataFrame:
+    """Merge multiple optional columns into one target column."""
+
+    df = df.copy()
+    source_columns = [standardize_column_name(col) for col in source_columns]
+    available = [col for col in source_columns if col in df.columns]
+
+    if not available:
+        df[target_column] = ""
+        return df
+
+    df[target_column] = (
+        df[available]
+        .fillna("")
+        .astype(str)
+        .apply(lambda row: separator.join([v.strip() for v in row if v.strip()]), axis=1)
+    )
+    return df
+
+
+def hash_value(value: object) -> Optional[str]:
+    """Hash a sensitive value using SHA-256 and a salt."""
+
+    if pd.isna(value) or str(value).strip() == "":
+        return None
+    raw_value = f"{HASH_SALT}|{str(value).strip()}"
+    return hashlib.sha256(raw_value.encode("utf-8")).hexdigest()
+
+
+def hash_columns(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
+    """Replace sensitive columns with hashed versions and drop original values."""
+
+    df = df.copy()
+    for column in columns:
+        column = standardize_column_name(column)
+        if column in df.columns:
+            df[f"{column}_hash"] = df[column].apply(hash_value)
+            df = df.drop(columns=[column])
+    return df
+
+
+def process_external_id_fields(df: pd.DataFrame) -> pd.DataFrame:
+    """Create hashed external ID fields from optional scanned/manual ID columns."""
+
+    df = df.copy()
+    for source_columns, target_column in EXTERNAL_ID_MAPPINGS:
+        df = merge_available_fields(df, source_columns, target_column.replace("_hash", ""))
+        df[target_column] = df[target_column.replace("_hash", "")].apply(hash_value)
+        df = df.drop(columns=[target_column.replace("_hash", "")], errors="ignore")
+    return df
+
+
+def extract_approx_geolocation(df: pd.DataFrame) -> pd.DataFrame:
+    """Extract approximate location from Kobo _geolocation while avoiding precision risk.
+
+    Kobo commonly stores _geolocation as [latitude, longitude]. For confidentiality,
+    this portfolio version rounds coordinates to two decimals by default.
+    """
+
+    df = df.copy()
+    if "_geolocation" not in df.columns:
+        df["latitude_approx"] = None
+        df["longitude_approx"] = None
+        return df
+
+    geo = pd.DataFrame(df["_geolocation"].tolist(), index=df.index)
+    if geo.shape[1] >= 2:
+        latitude = pd.to_numeric(geo.iloc[:, 0], errors="coerce")
+        longitude = pd.to_numeric(geo.iloc[:, 1], errors="coerce")
+        if ANONYMIZE_GEOLOCATION:
+            latitude = latitude.round(2)
+            longitude = longitude.round(2)
+        df["latitude_approx"] = latitude
+        df["longitude_approx"] = longitude
+    else:
+        df["latitude_approx"] = None
+        df["longitude_approx"] = None
+
+    return df
+
+
+def parse_datetime_column(df: pd.DataFrame, column: str) -> pd.DataFrame:
+    df = df.copy()
+    if column in df.columns:
+        df[column] = pd.to_datetime(df[column], errors="coerce")
+    return df
+
+
+def convert_numeric_columns(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
+    df = df.copy()
+    for column in columns:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+    return df
+
+
+def calculate_household_size(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate household size from available demographic count fields."""
+
+    df = df.copy()
+    count_columns = [
+        "household_adult_male_count",
+        "household_adult_female_count",
+        "household_girl_count",
+        "household_boy_count",
+    ]
+    available = [col for col in count_columns if col in df.columns]
+
     if available:
-        df[new_col] = df[available].apply(
-            lambda row: '/'.join([str(val) for val in row if pd.notnull(val) and str(val).strip() != '']), 
-            axis=1
-        )
+        counts = df[available].apply(pd.to_numeric, errors="coerce").fillna(0)
+        df["household_size"] = counts.sum(axis=1).astype("Int64")
     else:
-        df[new_col] = ''
+        df["household_size"] = pd.NA
+
     return df
 
 
-def process_unhcr_columns(df):
-    """Process UNHCR columns efficiently"""
-    unhcr_mappings = [
-        (["Scan_UNHCR_1", "UNHCR_number", "Jordanian_ID1"], "UNHCR_1"),
-        (["Scan_UNHCR2", "UNHCR_2", "Jordanian_ID2"], "UNHCR_2"),
-        (["Scan_UNHCR3", "UNHCR_3", "Jordanian_ID3"], "UNHCR_3"),
-        (["Scan_UNHCR4", "UNHCR_4", "Jordanian_ID4"], "UNHCR_4"),
-        (["Scan_UNHCR5", "UNHCR_5", "Jordanian_ID5"], "UNHCR_5")
-    ]
-    
-    for columns, target in unhcr_mappings:
-        df = merge_columns_vectorized(df, columns, target)
-    
-    return df
+def format_duration_months(value: object) -> Optional[str]:
+    """Format a decimal month value into an approximate readable period."""
 
-
-def clean_and_process_data():
-    """Main data processing function with parallel API calls"""
-    print("Fetching data from Kobo API...")
-    
-    
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [
-            executor.submit(fetch_kobo_data, PROJECT_UID_1),
-            executor.submit(fetch_kobo_data, PROJECT_UID_2),
-            executor.submit(fetch_kobo_data, PROJECT_UID_3)
-        ]
-        project_data_1, project_data_2, project_data_3 = [f.result() for f in futures]
-    
-    
-    if not project_data_1 or 'results' not in project_data_1:
-        print("No data found for project 1")
-        return tuple([pd.DataFrame()] * 6)
-    
-    if not project_data_2 or 'results' not in project_data_2:
-        print("No data found for project 2")
-        return tuple([pd.DataFrame()] * 6)
-    
-    if not project_data_3 or 'results' not in project_data_3:
-        print("No data found for project 3")
-        return tuple([pd.DataFrame()] * 6)
-
-    print("Processing data...")
-    
-
-    df1 = pd.DataFrame(project_data_1['results'])
-    df2 = pd.DataFrame(project_data_2['results'])
-    df3 = pd.DataFrame(project_data_3['results'])
-    
-    
-    df1.columns = [col.split("/")[-1] for col in df1.columns]
-    df2.columns = [col.split("/")[-1] for col in df2.columns]
-    df3.columns = [col.split("/")[-1] for col in df3.columns]
-    
-    
-    municipality_columns = ["In_Irbid", "In_Ajloun", "In_Jerash", "In_Mafraq", "In_Amman"]
-    village_columns = [
-        "IQ_North_Irbid", "IQ_East_Irbid", "IQ_West_Irbid", "IQ_City_Centre",
-        "In_Bani_Obaid", "In_Kora", "In_Wastiyya", "In_Mazar", "In_Ramtha",
-        "In_Taibeh", "In_Bani_Kinana", "In_Aghwar_Shamaliyah", "In_Koforanjah",
-        "In_Ajloun_Qasabeh", "In_Sakra", "In_Arjan", "In_Jerash_Qasabeh", "In_Qada_Borma",
-        "In_Qada_Al_Mastaba", "In_Mafraq_Qasebeh", "In_Mansheh", "In_Irhab", "In_Balama_a",
-        "In_Hosha", "In_Sama_Al_Sarhan", "In_Um_AL_jimal", "In_Sabah", "In_Um_AL_Quttein",
-        "In_North_west_badiah", "Badiah_Shamaliyah", "Dier_Alkahf", "In_Jizah", "In_marka",
-        "In_Jamaa", "In_Quaismeh", "In_Muaqar", "In_qasabetAmman", "In_Wadisyr", "In_sahab", "In_naour"
-    ]
-    
-    
-    df1 = merge_municipality_village(df1, municipality_columns, 'Municipality')
-    df1 = merge_municipality_village(df1, village_columns, 'Village')
-    df2 = merge_municipality_village(df2, municipality_columns, 'Municipality')
-    df2 = merge_municipality_village(df2, village_columns, 'Village')
-    
-    
-    df1 = df1.rename(columns={'Benef_Code': 'REG_USE'})
-    df2 = df2.rename(columns={'Benef_Code': 'REG_USE'})
-    df3 = df3.rename(columns={'Reg_number': 'REG_USE'})
-    
-    
-    df3['family_Size'] = (df3['men'].fillna('').astype(str) + ' ' + 
-                          df3['women'].fillna('').astype(str) + ' ' + 
-                          df3['girls'].fillna('').astype(str) + ' ' + 
-                          df3['boys'].fillna('').astype(str)).str.strip()
-    
-    
-    df1['Contract_Code'] = 'CFR-' + df1['REG_USE'].astype(str)
-    df2['Contract_Code'] = 'FLEX-' + df2['REG_USE'].astype(str)
-    
-    
-    df1 = process_unhcr_columns(df1)
-    df2 = process_unhcr_columns(df2)
-    
-    
-    if '_geolocation' in df1.columns:
-        df1[['longitude', 'latitude']] = pd.DataFrame(df1['_geolocation'].tolist(), index=df1.index)
-    else:
-        df1[['longitude', 'latitude']] = ['', '']
-        
-    if '_geolocation' in df2.columns:
-        df2[['longitude', 'latitude']] = pd.DataFrame(df2['_geolocation'].tolist(), index=df2.index)
-    else:
-        df2[['longitude', 'latitude']] = ['', '']
-    
-    
-    social_columns = [
-        'REG_USE', 'today', 'Staff_1', 'HoH_Full_Name_Arabic', 'HoH_Full_Name_English', 
-        'Phone_1', 'Phone_2', 'UNHCR_1', 'UNHCR_2', 'UNHCR_3', 'UNHCR_4', 'UNHCR_5',
-        'Activity', 'nationality', 'Governorate', 'Municipality', 'Village', 'Address', 
-        '_submission_time', 'Contract_Code', 'longitude', 'latitude'
-    ]
-    
-    social_df1 = df1.reindex(columns=social_columns, fill_value='')
-    social_df2 = df2.reindex(columns=social_columns, fill_value='')
-    combined_social = pd.concat([social_df1, social_df2], ignore_index=True)
-    
-    combined_social = combined_social[
-        (combined_social['REG_USE'].notna()) & 
-        (combined_social['REG_USE'] != '') &
-        (combined_social['Activity'] == 'case_val')
-    ].copy()
-    
-    combined_social['_submission_time'] = pd.to_datetime(combined_social['_submission_time'], errors='coerce')
-    combined_social = (combined_social
-                       .sort_values(by='_submission_time', ascending=False)
-                       .drop_duplicates(subset='REG_USE', keep='first')
-                       .fillna(''))
-    
-    
-    landlord_columns = [
-        'REG_USE', 'Name_Owner_ENG', 'Name_Owner_AR', 'Phone_Owner', 'Phone_Owner2',
-        'ID_Owner', 'PoA_auth', 'POA_Eng', 'POA_Ar', 'PoA_phone', 'PoA_phone2', 
-        'POA_ID', '_submission_time', 'Activity', 'Contract_Code'
-    ]
-    
-    landlord_df1 = df1.reindex(columns=landlord_columns, fill_value='')
-    landlord_df2 = df2.reindex(columns=landlord_columns, fill_value='')
-    combined_landlord = pd.concat([landlord_df1, landlord_df2], ignore_index=True)
-    
-    combined_landlord = combined_landlord[
-        (combined_landlord['REG_USE'].notna()) & 
-        (combined_landlord['REG_USE'] != '') &
-        (combined_landlord['Activity'].isin(['case_val', 'landlord_data'])) &
-        (combined_landlord['Name_Owner_ENG'].notna()) &
-        (combined_landlord['Name_Owner_ENG'] != '')
-    ].copy()
-    
-    combined_landlord['_submission_time'] = pd.to_datetime(combined_landlord['_submission_time'], errors='coerce')
-    combined_landlord = (combined_landlord
-                         .sort_values(by='_submission_time', ascending=False)
-                         .drop_duplicates(subset='REG_USE', keep='first')
-                         .fillna(''))
-    
-    
-    agreement_columns_CFR = [
-        'REG_USE', 'Signed_Rent', 'total_people', 'people', 'Month_support',
-        'Month_Covered', 'Monthly_amount_covered_by_NRC', 'total_fund',
-        '_submission_time', 'Activity', 'Contract_Code'
-    ]
-    
-    agreement_columns_FLEX = [
-        'REG_USE', 'rent_prop', 'total_people_agreement', 'total_people', 'Vulnerability_Score',
-        'total_fund_cal', 'total_boq_cost', 'total_EE_cost', 'rent_support_remaining_val',
-        'rent_agreed', 'months_nrc_paid_rent_val', 'Repairs_months', 'Activity', 
-        '_submission_time', 'Contract_Code'
-    ]
-    
-    agreement_df1 = df1.reindex(columns=agreement_columns_CFR, fill_value='')
-    agreement_df2 = df2.reindex(columns=agreement_columns_FLEX, fill_value='')
-    agreement_df2 = agreement_df2.dropna(subset=['total_fund_cal'])
-    
-    agreement_df2 = agreement_df2.rename(columns={
-        "rent_agreed": "Month_support",
-        "total_fund_cal": "total_fund"
-    })
-    
-    agreement_df1['family_Size'] = (agreement_df1['total_people'].fillna('').astype(str) + ' ' + 
-                                     agreement_df1['people'].fillna('').astype(str)).str.strip()
-    agreement_df2['family_Size'] = (agreement_df2['total_people'].fillna('').astype(str) + ' ' + 
-                                     agreement_df2['total_people_agreement'].fillna('').astype(str)).str.strip()
-    
-    combined_agreement = pd.concat([agreement_df1, agreement_df2], ignore_index=True)
-    
-    combined_agreement = combined_agreement[
-        (combined_agreement['REG_USE'].notna()) & 
-        (combined_agreement['REG_USE'] != '') &
-        (combined_agreement['Activity'].isin(['case_val', 'agreement']))
-    ].copy()
-    
-    combined_agreement['_submission_time'] = pd.to_datetime(combined_agreement['_submission_time'], errors='coerce')
-    combined_agreement = (combined_agreement
-                          .sort_values(by='_submission_time', ascending=False)
-                          .drop_duplicates(subset='REG_USE', keep='first')
-                          .fillna(''))
-    
-    
-    numeric_cols = ['Month_Covered', 'months_nrc_paid_rent_val', 'Repairs_months', 
-                    'total_fund', 'total_boq_cost']
-    for col in numeric_cols:
-        if col in combined_agreement.columns:
-            combined_agreement[col] = pd.to_numeric(combined_agreement[col], errors='coerce')
-    
-    
-    def format_months(x):
-        if pd.notnull(x) and x > 0 and np.isfinite(x):
-            return f"{int(x)} months and {int((x - int(x)) * 30)} days"
-        return None
-    
-    combined_agreement['Month_Coverd_Rent_CFR'] = combined_agreement['Month_Covered'].apply(format_months)
-    combined_agreement['Month_Coverd_Rent_FLEX'] = combined_agreement['months_nrc_paid_rent_val'].apply(format_months)
-    combined_agreement['Months_Coverd_Period_FLEX'] = (
-        combined_agreement['months_nrc_paid_rent_val'].fillna(0) + 
-        combined_agreement['Repairs_months'].fillna(0)
-    ).apply(format_months)
-    
-    
-    combined_agreement['Percent_70'] = np.where(
-        combined_agreement['rent_prop'] == 'no',
-        combined_agreement['total_boq_cost'] * 0.7,
-        combined_agreement['total_fund'] * 0.7
-    )
-    
-    combined_agreement['Percent_30'] = np.where(
-        combined_agreement['rent_prop'] == 'no',
-        combined_agreement['total_boq_cost'] * 0.3,
-        combined_agreement['total_fund'] * 0.3
-    )
-    
-    
-    combined_agreement['Month_Covered'] = combined_agreement['Month_Covered'].round(2)
-    combined_agreement['months_nrc_paid_rent_val'] = combined_agreement['months_nrc_paid_rent_val'].round(2)
-    combined_agreement['Month_support'] = combined_agreement['Month_support'].replace('', None)
-    combined_agreement = combined_agreement.replace({np.nan: None, np.inf: None, -np.inf: None})
-    
-    
-    update_columns = [
-        'REG_USE', 'HoH_Full_Name_English', 'HoH_Full_Name_Arabic', 'Phone', 'Phone_2',
-        'family_Size', 'UNHCR_number', 'UNHCR_2', 'UNHCR_3', 'UNHCR_4', 'UNHCR_5',
-        'Activity', '_submission_time'
-    ]
-    
-    update_df = df3.reindex(columns=update_columns, fill_value='')
-    update_df = update_df[
-        (update_df['REG_USE'].notna()) &
-        (update_df['Activity'] == 'Beneficiary_Update')
-    ].copy()
-    
-    update_df['_submission_time'] = pd.to_datetime(update_df['_submission_time'], errors='coerce')
-    update_df = (update_df
-                 .sort_values(by='_submission_time', ascending=False)
-                 .drop_duplicates(subset='REG_USE', keep='first')
-                 .fillna(''))
-    
-    
-    sign_CFR_columns = [
-        'REG_USE', 'Contract_Code', 'Activity', 'Staff_1', 'Lease_Start_Date', 'Sign_Contract',
-        'Payment_Method', 'PoA_Sign_Session', 'POA_Eng', 'POA_Ar', 'PoA_phone',
-        'PoA_phone2', 'POA_ID', '_submission_time'
-    ]
-    
-    sign_FLEX_columns = [
-        'REG_USE', 'Contract_Code', 'Activity', 'Staff_1', 'renting', 'Lease_Start_Date', 
-        'Sign_Flex_Contract', 'Payment_Method', 'PoA_Sign_Session', 'POA_Eng', 'POA_Ar', 
-        'PoA_phone', 'PoA_phone2', 'POA_ID', '_submission_time'
-    ]
-    
-    sign_CFR_df = df1.reindex(columns=sign_CFR_columns, fill_value='')
-    sign_FLEX_df = df2.reindex(columns=sign_FLEX_columns, fill_value='')
-    
-    sign_CFR_df = sign_CFR_df[sign_CFR_df['Activity'] == 'ctrct_sign'].copy()
-    sign_FLEX_df = sign_FLEX_df[sign_FLEX_df['Activity'] == 'flex_sign'].copy()
-    sign_FLEX_df = sign_FLEX_df.rename(columns={'Sign_Flex_Contract': 'Sign_Contract'})
-    
-    combined_sign = pd.concat([sign_CFR_df, sign_FLEX_df], ignore_index=True)
-    combined_sign = combined_sign[
-        (combined_sign['REG_USE'].notna()) & 
-        (combined_sign['REG_USE'] != '')
-    ].copy()
-    
-    combined_sign['_submission_time'] = pd.to_datetime(combined_sign['_submission_time'], errors='coerce')
-    combined_sign['Lease_Start_Date'] = pd.to_datetime(combined_sign['Lease_Start_Date'], errors='coerce')
-    combined_sign = (combined_sign
-                     .sort_values(by='_submission_time', ascending=False)
-                     .drop_duplicates(subset='REG_USE', keep='first')
-                     .replace({np.nan: None}))
-    
-    
-    cancel_columns = [
-        'REG_USE', 'Contract_Code', 'Activity', 'Staff_1', 'Why_Cancel', 'Cancel_Note',
-        'Notes', '_id', '_submission_time'
-    ]
-    
-    cancel_df1 = df1.reindex(columns=cancel_columns, fill_value='')
-    cancel_df2 = df2.reindex(columns=cancel_columns, fill_value='')
-    combined_cancel = pd.concat([cancel_df1, cancel_df2], ignore_index=True)
-    
-    combined_cancel = combined_cancel[
-        (combined_cancel['REG_USE'].notna()) &
-        (combined_cancel['Activity'] == 'Cancel')
-    ].copy()
-    
-    combined_cancel['_submission_time'] = pd.to_datetime(combined_cancel['_submission_time'], errors='coerce')
-    combined_cancel = (combined_cancel
-                       .sort_values(by='_submission_time', ascending=False)
-                       .drop_duplicates(subset='REG_USE', keep='first')
-                       .fillna(''))
-    
-    print(f"Processed: {len(combined_social)} social, {len(combined_landlord)} landlord, "
-          f"{len(combined_agreement)} agreement, {len(update_df)} updates, "
-          f"{len(combined_sign)} sign, {len(combined_cancel)} cancel records")
-    
-    return (combined_social, combined_landlord, combined_agreement, 
-            update_df, combined_sign, combined_cancel)
-
-
-def insert_into_mysql(combined_social, combined_landlord, combined_agreement, 
-                      update_df, combined_sign, combined_cancel):
-    """Insert data into MySQL using batch operations"""
     try:
-        print("Connecting to MySQL...")
-        connection = pymysql.connect(
-            host=MYSQL_HOST,
-            user=MYSQL_USER,
-            password=MYSQL_PASSWORD,
-            database=MYSQL_DB
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if not np.isfinite(numeric_value) or numeric_value <= 0:
+        return None
+
+    months = int(numeric_value)
+    days = int(round((numeric_value - months) * 30))
+    return f"{months} months and {days} days"
+
+
+def latest_record_by_case(
+    df: pd.DataFrame,
+    case_column: str = "case_id",
+    date_column: str = "submission_date",
+) -> pd.DataFrame:
+    """Keep the most recent record per case ID."""
+
+    if df.empty or case_column not in df.columns:
+        return df
+
+    df = parse_datetime_column(df, date_column)
+    df = df[(df[case_column].notna()) & (df[case_column].astype(str).str.strip() != "")].copy()
+    return (
+        df.sort_values(by=date_column, ascending=False)
+        .drop_duplicates(subset=case_column, keep="first")
+        .reset_index(drop=True)
+    )
+
+
+def reindex_columns(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    """Select expected columns and create missing columns as nulls."""
+
+    return df.reindex(columns=columns, fill_value=None)
+
+
+# -----------------------------------------------------------------------------
+# Main transformation logic
+# -----------------------------------------------------------------------------
+
+
+def prepare_source_frames(source_frames: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Prepare three logical sources from the fetched frames.
+
+    The original production workflow used multiple Kobo forms. In this anonymized
+    sample, source_1 and source_2 represent two assistance modalities, while
+    source_3 represents participant update records.
+    """
+
+    frames = list(source_frames.values())
+    while len(frames) < 3:
+        frames.append(pd.DataFrame())
+
+    modality_a = frames[0].copy()
+    modality_b = frames[1].copy()
+    updates = frames[2].copy()
+
+    # Harmonize alternative case ID column names into one standard case_id field.
+    modality_a = rename_if_present(modality_a, {"participant_code": "case_id"})
+    modality_b = rename_if_present(modality_b, {"participant_code": "case_id"})
+    updates = rename_if_present(updates, {"registration_number": "case_id"})
+
+    # Standardize submission timestamp naming.
+    for frame_name, frame in [("modality_a", modality_a), ("modality_b", modality_b), ("updates", updates)]:
+        if "_submission_time" in frame.columns and "submission_date" not in frame.columns:
+            frame.rename(columns={"_submission_time": "submission_date"}, inplace=True)
+        logger.info("%s columns prepared: %s", frame_name, len(frame.columns))
+
+    # Create anonymized modality codes rather than exposing internal programme codes.
+    if not modality_a.empty:
+        modality_a["assistance_code"] = "MOD-A-" + modality_a.get("case_id", "").astype(str)
+    if not modality_b.empty:
+        modality_b["assistance_code"] = "MOD-B-" + modality_b.get("case_id", "").astype(str)
+
+    return modality_a, modality_b, updates
+
+
+def transform_data(source_frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    """Transform raw Kobo records into analytical MySQL-ready tables."""
+
+    modality_a, modality_b, updates = prepare_source_frames(source_frames)
+
+    for frame in (modality_a, modality_b):
+        if not frame.empty:
+            frame = merge_available_fields(frame, ADMIN_1_SOURCE_COLUMNS, "admin_1", separator="/")
+            frame = merge_available_fields(frame, ADMIN_2_SOURCE_COLUMNS, "admin_2", separator="/")
+
+    # Apply transformations separately and reassign because pandas frames are immutable in helpers.
+    modality_a = merge_available_fields(modality_a, ADMIN_1_SOURCE_COLUMNS, "admin_1", separator="/")
+    modality_a = merge_available_fields(modality_a, ADMIN_2_SOURCE_COLUMNS, "admin_2", separator="/")
+    modality_a = process_external_id_fields(modality_a)
+    modality_a = extract_approx_geolocation(modality_a)
+
+    modality_b = merge_available_fields(modality_b, ADMIN_1_SOURCE_COLUMNS, "admin_1", separator="/")
+    modality_b = merge_available_fields(modality_b, ADMIN_2_SOURCE_COLUMNS, "admin_2", separator="/")
+    modality_b = process_external_id_fields(modality_b)
+    modality_b = extract_approx_geolocation(modality_b)
+
+    updates = calculate_household_size(updates)
+    updates = process_external_id_fields(updates)
+
+    # ------------------------------------------------------------------
+    # Participant profile table
+    # ------------------------------------------------------------------
+    profile_a = reindex_columns(modality_a, PROFILE_SOURCE_COLUMNS)
+    profile_b = reindex_columns(modality_b, PROFILE_SOURCE_COLUMNS)
+    participant_profile = pd.concat([profile_a, profile_b], ignore_index=True)
+
+    participant_profile = participant_profile[
+        participant_profile["case_id"].notna()
+        & (participant_profile["case_id"].astype(str).str.strip() != "")
+    ].copy()
+
+    # Keep only validation-type records where applicable. The generic value below
+    # should be replaced with the approved activity type from the source tool.
+    if "activity_type" in participant_profile.columns:
+        participant_profile = participant_profile[
+            participant_profile["activity_type"].fillna("").isin(["case_validation", "case_update", ""])
+        ].copy()
+
+    participant_profile = latest_record_by_case(participant_profile)
+
+    # Hash direct identifiers after building the profile output.
+    participant_profile = hash_columns(
+        participant_profile,
+        ["participant_name_local", "participant_name_english", "contact_1", "contact_2"],
+    )
+
+    # ------------------------------------------------------------------
+    # Service provider table
+    # ------------------------------------------------------------------
+    provider_a = reindex_columns(modality_a, SERVICE_PROVIDER_SOURCE_COLUMNS)
+    provider_b = reindex_columns(modality_b, SERVICE_PROVIDER_SOURCE_COLUMNS)
+    service_provider = pd.concat([provider_a, provider_b], ignore_index=True)
+
+    if not service_provider.empty:
+        service_provider = service_provider[
+            service_provider["case_id"].notna()
+            & (service_provider["case_id"].astype(str).str.strip() != "")
+        ].copy()
+        service_provider = latest_record_by_case(service_provider)
+        service_provider = hash_columns(
+            service_provider,
+            [
+                "provider_name",
+                "provider_contact_1",
+                "provider_contact_2",
+                "provider_id",
+                "proxy_name",
+                "proxy_contact_1",
+                "proxy_contact_2",
+                "proxy_id",
+            ],
         )
-        cursor = connection.cursor()
-        
-        
-        insert_query_social = """
-            INSERT INTO social (REG_USE, Full_Name_Arabic, Full_Name_English, Phone_1, Phone_2, 
-                                UNHCR_1, UNHCR_2, UNHCR_3, UNHCR_4, UNHCR_5, Activity, Nationality, 
-                                Governorate, Municipality, Village, Submission_date, Staff_1, Address, 
-                                Contract_Code, longitude, latitude)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-            Full_Name_Arabic = VALUES(Full_Name_Arabic),
-            Full_Name_English = VALUES(Full_Name_English),
-            Phone_1 = VALUES(Phone_1),
-            Phone_2 = VALUES(Phone_2),
-            UNHCR_1 = VALUES(UNHCR_1),
-            UNHCR_2 = VALUES(UNHCR_2),
-            UNHCR_3 = VALUES(UNHCR_3),
-            UNHCR_4 = VALUES(UNHCR_4),
-            UNHCR_5 = VALUES(UNHCR_5),
-            Activity = VALUES(Activity),
-            Nationality = VALUES(Nationality),
-            Governorate = VALUES(Governorate),
-            Municipality = VALUES(Municipality),
-            Village = VALUES(Village),
-            Submission_date = VALUES(Submission_date),
-            Staff_1 = VALUES(Staff_1),
-            Address = VALUES(Address),
-            Contract_Code = VALUES(Contract_Code),
-            longitude = VALUES(longitude),
-            latitude = VALUES(latitude)
+
+    # ------------------------------------------------------------------
+    # Assistance record table
+    # ------------------------------------------------------------------
+    assistance_a = reindex_columns(modality_a, ASSISTANCE_SOURCE_COLUMNS)
+    assistance_b = reindex_columns(modality_b, ASSISTANCE_SOURCE_COLUMNS)
+    assistance_record = pd.concat([assistance_a, assistance_b], ignore_index=True)
+
+    assistance_record = convert_numeric_columns(
+        assistance_record,
+        [
+            "signed_amount",
+            "household_members_reported",
+            "household_members_verified",
+            "assistance_duration_months",
+            "monthly_assistance_amount",
+            "total_assistance_amount",
+            "vulnerability_score",
+            "component_cost_a",
+            "component_cost_b",
+            "remaining_assistance_value",
+        ],
+    )
+
+    if not assistance_record.empty:
+        assistance_record = assistance_record[
+            assistance_record["case_id"].notna()
+            & (assistance_record["case_id"].astype(str).str.strip() != "")
+        ].copy()
+        assistance_record = latest_record_by_case(assistance_record)
+
+        # Example calculated fields for reporting and payment planning.
+        assistance_record["assistance_duration_text"] = assistance_record[
+            "assistance_duration_months"
+        ].apply(format_duration_months)
+        assistance_record["first_installment_amount"] = assistance_record[
+            "total_assistance_amount"
+        ].fillna(0) * 0.70
+        assistance_record["final_installment_amount"] = assistance_record[
+            "total_assistance_amount"
+        ].fillna(0) * 0.30
+
+    # ------------------------------------------------------------------
+    # Agreement/status table
+    # ------------------------------------------------------------------
+    agreement_a = reindex_columns(modality_a, AGREEMENT_STATUS_SOURCE_COLUMNS)
+    agreement_b = reindex_columns(modality_b, AGREEMENT_STATUS_SOURCE_COLUMNS)
+    agreement_status = pd.concat([agreement_a, agreement_b], ignore_index=True)
+
+    if not agreement_status.empty:
+        agreement_status = latest_record_by_case(agreement_status)
+        agreement_status = parse_datetime_column(agreement_status, "agreement_start_date")
+        agreement_status = hash_columns(
+            agreement_status,
+            ["proxy_name", "proxy_contact_1", "proxy_contact_2", "proxy_id"],
+        )
+
+    # ------------------------------------------------------------------
+    # Case closure table
+    # ------------------------------------------------------------------
+    closure_a = reindex_columns(modality_a, CASE_CLOSURE_SOURCE_COLUMNS)
+    closure_b = reindex_columns(modality_b, CASE_CLOSURE_SOURCE_COLUMNS)
+    case_closure = pd.concat([closure_a, closure_b], ignore_index=True)
+
+    if not case_closure.empty:
+        case_closure = case_closure[
+            case_closure["case_id"].notna()
+            & (case_closure["case_id"].astype(str).str.strip() != "")
+        ].copy()
+        case_closure = latest_record_by_case(case_closure)
+        # Do not store sensitive free-text notes in analytical outputs.
+        case_closure["closure_note_available"] = case_closure["closure_notes"].notna()
+        case_closure = case_closure.drop(columns=["closure_notes"], errors="ignore")
+
+    # ------------------------------------------------------------------
+    # Participant update table
+    # ------------------------------------------------------------------
+    participant_updates = reindex_columns(updates, UPDATE_SOURCE_COLUMNS + ["household_size"])
+    if not participant_updates.empty:
+        participant_updates = latest_record_by_case(participant_updates)
+        participant_updates = hash_columns(
+            participant_updates,
+            [
+                "participant_name_local",
+                "participant_name_english",
+                "contact_1",
+                "contact_2",
+                "external_id_1",
+                "external_id_2",
+                "external_id_3",
+                "external_id_4",
+                "external_id_5",
+            ],
+        )
+
+    outputs = {
+        "participant_profile": participant_profile,
+        "service_provider": service_provider,
+        "assistance_record": assistance_record,
+        "agreement_status": agreement_status,
+        "case_closure": case_closure,
+        "participant_updates": participant_updates,
+    }
+
+    return outputs
+
+
+# -----------------------------------------------------------------------------
+# Data quality reporting
+# -----------------------------------------------------------------------------
+
+
+def run_quality_checks(outputs: Dict[str, pd.DataFrame]) -> None:
+    """Log simple quality checks for each output table."""
+
+    for table_name, df in outputs.items():
+        if df.empty:
+            logger.warning("%s: no records prepared", table_name)
+            continue
+
+        missing_case_id = df["case_id"].isna().sum() if "case_id" in df.columns else "N/A"
+        duplicate_case_id = df.duplicated(subset=["case_id"]).sum() if "case_id" in df.columns else "N/A"
+        logger.info(
+            "%s: %s records | missing case_id: %s | duplicate case_id: %s",
+            table_name,
+            len(df),
+            missing_case_id,
+            duplicate_case_id,
+        )
+
+
+# -----------------------------------------------------------------------------
+# Loading
+# -----------------------------------------------------------------------------
+
+
+def clean_value(value: object) -> object:
+    """Convert pandas/numpy nulls and timestamps to database-friendly values."""
+
+    if pd.isna(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def get_mysql_connection(config: Dict[str, object]) -> pymysql.connections.Connection:
+    """Create MySQL connection."""
+
+    return pymysql.connect(
+        host=config["mysql_host"],
+        user=config["mysql_user"],
+        password=config["mysql_password"],
+        database=config["mysql_db"],
+        charset="utf8mb4",
+        autocommit=False,
+    )
+
+
+def upsert_dataframe(
+    connection: pymysql.connections.Connection,
+    table_name: str,
+    df: pd.DataFrame,
+    key_columns: List[str],
+) -> int:
+    """Batch upsert a dataframe into MySQL.
+
+    Assumption: target tables already exist and have a UNIQUE KEY or PRIMARY KEY
+    matching key_columns, usually case_id for these portfolio tables.
+    """
+
+    if df.empty:
+        logger.info("Skipping %s: dataframe is empty", table_name)
+        return 0
+
+    df = df.copy().replace({np.nan: None, np.inf: None, -np.inf: None})
+    columns = list(df.columns)
+    update_columns = [col for col in columns if col not in key_columns]
+
+    column_sql = ", ".join(f"`{col}`" for col in columns)
+    placeholder_sql = ", ".join(["%s"] * len(columns))
+    update_sql = ", ".join(f"`{col}` = VALUES(`{col}`)" for col in update_columns)
+
+    if update_sql:
+        query = f"""
+            INSERT INTO `{table_name}` ({column_sql})
+            VALUES ({placeholder_sql})
+            ON DUPLICATE KEY UPDATE {update_sql}
         """
-        
-        insert_landlord_query = """
-            INSERT INTO landlord_data (REG_USE, Name_Owner_ENG, Name_Owner_AR, Phone_Owner, 
-                                       Phone_Owner2, ID_Owner, PoA_auth, POA_Eng, POA_Ar, 
-                                       PoA_phone, PoA_phone2, POA_ID, _submission_time, 
-                                       Activity, Contract_Code)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-            Name_Owner_ENG = VALUES(Name_Owner_ENG),
-            Name_Owner_AR = VALUES(Name_Owner_AR),
-            Phone_Owner = VALUES(Phone_Owner),
-            Phone_Owner2 = VALUES(Phone_Owner2),
-            ID_Owner = VALUES(ID_Owner),
-            PoA_auth = VALUES(PoA_auth),
-            POA_Eng = VALUES(POA_Eng),
-            POA_Ar = VALUES(POA_Ar),
-            PoA_phone = VALUES(PoA_phone),
-            PoA_phone2 = VALUES(PoA_phone2),
-            POA_ID = VALUES(POA_ID),
-            _submission_time = VALUES(_submission_time),
-            Activity = VALUES(Activity),
-            Contract_Code = VALUES(Contract_Code)
+    else:
+        query = f"""
+            INSERT IGNORE INTO `{table_name}` ({column_sql})
+            VALUES ({placeholder_sql})
         """
-        
-        insert_agreement_query = """
-            INSERT INTO agreement (REG_USE, Month_Covered, Signed_Rent, Monthly_amount_covered_by_NRC,
-                                   months_nrc_paid_rent_val, rent_prop, total_boq_cost, Activity,
-                                   rent_support_remaining_val, total_fund, Repairs_months, total_EE_cost,
-                                   Month_support, Vulnerability_Score, family_Size, Month_Coverd_Rent_CFR,
-                                   Month_Coverd_Rent_FLEX, Months_Coverd_Period_FLEX, Percent_70,
-                                   Percent_30, _submission_time, Contract_Code)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-            Month_Covered = VALUES(Month_Covered),
-            Signed_Rent = VALUES(Signed_Rent),
-            Monthly_amount_covered_by_NRC = VALUES(Monthly_amount_covered_by_NRC),
-            months_nrc_paid_rent_val = VALUES(months_nrc_paid_rent_val),
-            rent_prop = VALUES(rent_prop),
-            total_boq_cost = VALUES(total_boq_cost),
-            Activity = VALUES(Activity),
-            rent_support_remaining_val = VALUES(rent_support_remaining_val),
-            total_fund = VALUES(total_fund),
-            Repairs_months = VALUES(Repairs_months),
-            total_EE_cost = VALUES(total_EE_cost),
-            Month_support = VALUES(Month_support),
-            Vulnerability_Score = VALUES(Vulnerability_Score),
-            family_Size = VALUES(family_Size),
-            Month_Coverd_Rent_CFR = VALUES(Month_Coverd_Rent_CFR),
-            Month_Coverd_Rent_FLEX = VALUES(Month_Coverd_Rent_FLEX),
-            Months_Coverd_Period_FLEX = VALUES(Months_Coverd_Period_FLEX),
-            Percent_70 = VALUES(Percent_70),
-            Percent_30 = VALUES(Percent_30),
-            _submission_time = VALUES(_submission_time),
-            Contract_Code = VALUES(Contract_Code)
-        """
-        
-        insert_sign_query = """
-            INSERT INTO sign (REG_USE, Contract_Code, Activity, Staff_1, Lease_Start_Date,
-                              Sign_Contract, renting, Payment_Method, PoA_Sign_Session, POA_Eng,
-                              POA_Ar, PoA_phone, PoA_phone2, POA_ID, _submission_time)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-            Contract_Code = VALUES(Contract_Code),
-            Activity = VALUES(Activity),
-            Staff_1 = VALUES(Staff_1),
-            Lease_Start_Date = VALUES(Lease_Start_Date),
-            Sign_Contract = VALUES(Sign_Contract),
-            renting = VALUES(renting),
-            Payment_Method = VALUES(Payment_Method),
-            PoA_Sign_Session = VALUES(PoA_Sign_Session),
-            POA_Eng = VALUES(POA_Eng),
-            POA_Ar = VALUES(POA_Ar),
-            PoA_phone = VALUES(PoA_phone),
-            PoA_phone2 = VALUES(PoA_phone2),
-            POA_ID = VALUES(POA_ID),
-            _submission_time = VALUES(_submission_time)
-        """
-        
-        insert_cancel_query = """
-            INSERT INTO cancel (REG_USE, Contract_Code, Activity, Staff_1, Why_Cancel,
-                                Cancel_Note, Notes, _submission_time, _id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-            Contract_Code = VALUES(Contract_Code),
-            Activity = VALUES(Activity),
-            Staff_1 = VALUES(Staff_1),
-            Why_Cancel = VALUES(Why_Cancel),
-            Cancel_Note = VALUES(Cancel_Note),
-            Notes = VALUES(Notes),
-            _submission_time = VALUES(_submission_time),
-            _id = VALUES(_id)
-        """
-        
-        update_query = """
-            UPDATE social
-            SET Full_Name_Arabic = %s, Full_Name_English = %s, Phone_1 = %s, Phone_2 = %s,
-                UNHCR_1 = %s, UNHCR_2 = %s, UNHCR_3 = %s, UNHCR_4 = %s, UNHCR_5 = %s,
-                Activity = %s, Submission_date = %s
-            WHERE REG_USE = %s
-        """
-        
-        
-        if not combined_social.empty:
-            
-            social_values = [
-                (row['REG_USE'], row['HoH_Full_Name_Arabic'], row['HoH_Full_Name_English'],
-                 row['Phone_1'], row['Phone_2'], row['UNHCR_1'], row['UNHCR_2'],
-                 row['UNHCR_3'], row['UNHCR_4'], row['UNHCR_5'], row['Activity'],
-                 row['nationality'], row['Governorate'], row['Municipality'], row['Village'],
-                 row['_submission_time'], row['Staff_1'], row['Address'], row['Contract_Code'],
-                 row['longitude'], row['latitude'])
-                for _, row in combined_social.iterrows() if str(row['REG_USE']).strip()
-            ]
-            if social_values:
-                cursor.executemany(insert_query_social, social_values)
-                
-        
-        
-        if not combined_landlord.empty:
-            
-            landlord_values = [
-                (row['REG_USE'], row['Name_Owner_ENG'], row['Name_Owner_AR'],
-                 row['Phone_Owner'], row['Phone_Owner2'], row['ID_Owner'],
-                 row['PoA_auth'], row['POA_Eng'], row['POA_Ar'], row['PoA_phone'],
-                 row['PoA_phone2'], row['POA_ID'], row['_submission_time'],
-                 row['Activity'], row['Contract_Code'])
-                for _, row in combined_landlord.iterrows() if str(row['REG_USE']).strip()
-            ]
-            if landlord_values:
-                cursor.executemany(insert_landlord_query, landlord_values)
-                
-        
-        
-        if not combined_agreement.empty:
-            
-            agreement_values = [
-                (row['REG_USE'], row['Month_Covered'], row['Signed_Rent'],
-                 row['Monthly_amount_covered_by_NRC'], row['months_nrc_paid_rent_val'],
-                 row['rent_prop'], row['total_boq_cost'], row['Activity'],
-                 row['rent_support_remaining_val'], row['total_fund'], row['Repairs_months'],
-                 row['total_EE_cost'], row['Month_support'], row['Vulnerability_Score'],
-                 row['family_Size'], row['Month_Coverd_Rent_CFR'], row['Month_Coverd_Rent_FLEX'],
-                 row['Months_Coverd_Period_FLEX'], row['Percent_70'], row['Percent_30'],
-                 row['_submission_time'], row['Contract_Code'])
-                for _, row in combined_agreement.iterrows() if str(row['REG_USE']).strip()
-            ]
-            if agreement_values:
-                cursor.executemany(insert_agreement_query, agreement_values)
-                
-        
-        
-        if not combined_sign.empty:
-            
-            sign_values = [
-                (row['REG_USE'], row['Contract_Code'], row['Activity'], row['Staff_1'],
-                 row['Lease_Start_Date'], row['Sign_Contract'], row.get('renting', ''),
-                 row['Payment_Method'], row['PoA_Sign_Session'], row['POA_Eng'],
-                 row['POA_Ar'], row['PoA_phone'], row['PoA_phone2'], row['POA_ID'],
-                 row['_submission_time'])
-                for _, row in combined_sign.iterrows() if str(row['REG_USE']).strip()
-            ]
-            if sign_values:
-                cursor.executemany(insert_sign_query, sign_values)
-               
-        
-        
-        if not combined_cancel.empty:
-            
-            cancel_values = [
-                (row['REG_USE'], row['Contract_Code'], row['Activity'], row['Staff_1'],
-                 row['Why_Cancel'], row['Cancel_Note'], row['Notes'],
-                 row['_submission_time'], row['_id'])
-                for _, row in combined_cancel.iterrows() if str(row['REG_USE']).strip()
-            ]
-            if cancel_values:
-                cursor.executemany(insert_cancel_query, cancel_values)
-                
-        
-        
-        if not update_df.empty:
-            print(f"Updating {len(update_df)} beneficiary records...")
-            update_values = [
-                (row['HoH_Full_Name_Arabic'], row['HoH_Full_Name_English'],
-                 row['Phone'], row['Phone_2'], row['UNHCR_number'], row['UNHCR_2'],
-                 row['UNHCR_3'], row['UNHCR_4'], row['UNHCR_5'], row['Activity'],
-                 row['_submission_time'], row['REG_USE'])
-                for _, row in update_df.iterrows()
-            ]
-            if update_values:
-                cursor.executemany(update_query, update_values)
-                print(f"✓ Updated {len(update_values)} beneficiary records")
-        
+
+    values = [tuple(clean_value(row[col]) for col in columns) for _, row in df.iterrows()]
+
+    with connection.cursor() as cursor:
+        cursor.executemany(query, values)
+
+    logger.info("Upserted %s records into %s", len(values), table_name)
+    return len(values)
+
+
+def load_outputs_to_mysql(config: Dict[str, object], outputs: Dict[str, pd.DataFrame]) -> None:
+    """Load all output tables into MySQL in one transaction."""
+
+    connection: Optional[pymysql.connections.Connection] = None
+    try:
+        connection = get_mysql_connection(config)
+
+        for table_name, df in outputs.items():
+            upsert_dataframe(connection, table_name, df, key_columns=["case_id"])
+
         connection.commit()
-        print("\n✅ All data inserted/updated successfully!")
-        
-    except pymysql.MySQLError as e:
-        print(f"\n❌ MySQL Error: {e}")
+        logger.info("All outputs committed successfully.")
+
+    except pymysql.MySQLError as exc:
+        logger.error("MySQL error: %s", exc)
         if connection:
             connection.rollback()
-            print("Transaction rolled back")
-        
-    except Exception as e:
-        print(f"\n❌ Unexpected Error: {e}")
+            logger.info("Transaction rolled back.")
+        raise
+
+    except Exception as exc:
+        logger.error("Unexpected loading error: %s", exc)
         if connection:
             connection.rollback()
-        
+            logger.info("Transaction rolled back.")
+        raise
+
     finally:
-        if cursor:
-            cursor.close()
         if connection:
             connection.close()
-        print("Database connection closed")
+            logger.info("Database connection closed.")
+
+
+# -----------------------------------------------------------------------------
+# Main entry point
+# -----------------------------------------------------------------------------
+
+
+def main() -> None:
+    logger.info("=" * 70)
+    logger.info("ANONYMIZED KOBO TO MYSQL ETL PIPELINE")
+    logger.info("=" * 70)
+
+    config = load_config()
+    source_frames = fetch_all_sources(config)
+    outputs = transform_data(source_frames)
+    run_quality_checks(outputs)
+
+    if LOAD_TO_MYSQL:
+        load_outputs_to_mysql(config, outputs)
+    else:
+        logger.info("LOAD_TO_MYSQL=false; skipping database load step.")
+
+    logger.info("ETL sync complete.")
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("KOBO TO MYSQL DATA SYNC - OPTIMIZED VERSION")
-    print("=" * 60)
-    
-    
-    result = clean_and_process_data()
-    combined_social, combined_landlord, combined_agreement, update_df, combined_sign, combined_cancel = result
-    
-    
-    has_data = any([
-        not combined_social.empty,
-        not combined_landlord.empty,
-        not combined_agreement.empty,
-        not update_df.empty,
-        not combined_sign.empty,
-        not combined_cancel.empty
-    ])
-    
-    if has_data:
-        insert_into_mysql(combined_social, combined_landlord, combined_agreement, 
-                         update_df, combined_sign, combined_cancel)
-    else:
-        print("\n⚠️ No data to insert.")
-    
-    print("=" * 60)
-    print("SYNC COMPLETE")
-    print("=" * 60)
+    main()
