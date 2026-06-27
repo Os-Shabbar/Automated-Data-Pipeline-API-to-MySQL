@@ -1,5 +1,5 @@
 """
-Portfolio Sample: Anonymized KoboToolbox-to-MySQL ETL Pipeline
+Portfolio Sample: Anonymized KoboToolbox-to-SQL ETL Pipeline
 Author: Osama Shabbar
 
 Purpose
@@ -9,7 +9,7 @@ This script demonstrates an ETL workflow for humanitarian programme monitoring d
 2. Standardize and harmonize inconsistent field structures across forms.
 3. Apply data quality checks, deduplication, date parsing, and numeric conversions.
 4. Protect sensitive fields through hashing and location approximation.
-5. Load cleaned analytical tables into MySQL using batch upserts.
+5. Load cleaned analytical tables into SQL using batch upserts.
 
 Confidentiality Note
 --------------------
@@ -31,7 +31,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import pymysql
+import pyodbc
 import requests
 
 
@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))
 ANONYMIZE_GEOLOCATION = os.getenv("ANONYMIZE_GEOLOCATION", "true").lower() == "true"
-LOAD_TO_MYSQL = os.getenv("LOAD_TO_MYSQL", "true").lower() == "true"
+LOAD_TO_SQLSERVER = os.getenv("LOAD_TO_SQLSERVER", "true").lower() == "true"
 
 # Hash salt should be stored securely as an environment variable in production.
 # For portfolio/demo use, this fallback keeps the sample runnable but should not be
@@ -73,21 +73,7 @@ def get_required_env(name: str) -> str:
 
 
 def load_config() -> Dict[str, object]:
-    """Load configuration from environment variables.
-
-    Required environment variables:
-        KOBO_BASE_URL          Example: https://kf.kobotoolbox.org/api/v2/assets/
-        KOBO_API_TOKEN         Kobo API token
-        KOBO_PROJECT_UID_1     Kobo form asset UID for modality/source 1
-        KOBO_PROJECT_UID_2     Kobo form asset UID for modality/source 2
-        KOBO_PROJECT_UID_3     Kobo form asset UID for update/source 3
-
-    Required only when LOAD_TO_MYSQL=true:
-        MYSQL_HOST
-        MYSQL_USER
-        MYSQL_PASSWORD
-        MYSQL_DB
-    """
+   
 
     project_uids = [
         os.getenv("KOBO_PROJECT_UID_1"),
@@ -105,15 +91,20 @@ def load_config() -> Dict[str, object]:
         "project_uids": project_uids,
     }
 
-    if LOAD_TO_MYSQL:
-        config.update(
-            {
-                "mysql_host": get_required_env("MYSQL_HOST"),
-                "mysql_user": get_required_env("MYSQL_USER"),
-                "mysql_password": get_required_env("MYSQL_PASSWORD"),
-                "mysql_db": get_required_env("MYSQL_DB"),
-            }
-        )
+    if LOAD_TO_SQLSERVER:
+    config.update(
+        {
+            "sqlserver_host": get_required_env("SQLSERVER_HOST"),
+            "sqlserver_port": os.getenv("SQLSERVER_PORT", "1433"),
+            "sqlserver_user": get_required_env("SQLSERVER_USER"),
+            "sqlserver_password": get_required_env("SQLSERVER_PASSWORD"),
+            "sqlserver_db": get_required_env("SQLSERVER_DB"),
+            "sqlserver_driver": os.getenv(
+                "SQLSERVER_DRIVER",
+                "ODBC Driver 18 for SQL Server",
+            ),
+        }
+    )
 
     return config
 
@@ -531,7 +522,7 @@ def prepare_source_frames(source_frames: Dict[str, pd.DataFrame]) -> Tuple[pd.Da
 
 
 def transform_data(source_frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
-    """Transform raw Kobo records into analytical MySQL-ready tables."""
+    """Transform raw Kobo records into analytical SQL-ready tables."""
 
     modality_a, modality_b, updates = prepare_source_frames(source_frames)
 
