@@ -1,10 +1,10 @@
-# Anonymized Survey API to MySQL ETL Pipeline
+# Anonymized Survey API to SQL ETL Pipeline
 
 **Automated Data Pipeline for Humanitarian Information Management**
 
 ## Overview
 
-This project demonstrates an anonymized ETL pipeline that extracts structured survey data from multiple API endpoints, cleans and standardizes heterogeneous schemas, applies data quality checks and business rules, and loads the processed data into a structured MySQL database for reporting and analytics.
+This project demonstrates an anonymized ETL pipeline that extracts structured survey data from multiple API endpoints, cleans and standardizes heterogeneous schemas, applies data quality checks and business rules, and loads the processed data into a structured SQL database for reporting and analytics.
 
 The pipeline was designed as a portfolio-safe sample to demonstrate practical information management, API-based data integration, data cleaning, deduplication, and database loading workflows relevant to humanitarian and development programme monitoring.
 
@@ -20,7 +20,7 @@ All sensitive fields, organization-specific references, personal identifiers, lo
 * Merge and deduplicate records across multiple sources.
 * Retain the latest valid submission per unique record/entity.
 * Apply workflow-specific business logic and derived calculations.
-* Maintain structured MySQL tables for downstream analytics, dashboards, and reporting.
+* Maintain structured SQL tables for downstream analytics, dashboards, and reporting.
 * Demonstrate a scalable approach for additional APIs, forms, or monitoring data sources.
 
 ---
@@ -31,8 +31,8 @@ All sensitive fields, organization-specific references, personal identifiers, lo
 * **Pandas** – data cleaning, transformation, and schema harmonization
 * **NumPy** – numerical calculations and missing-value handling
 * **Requests** – API extraction and authenticated data retrieval
-* **MySQL** – relational database storage
-* **PyMySQL** – Python-to-MySQL database connection and batch loading
+* **SQL** – relational database storage
+* **PySQL** – Python-to-SQL database connection and batch loading
 * **Environment Variables** – secure handling of credentials and configuration
 
 ---
@@ -69,7 +69,7 @@ Key features:
 
 ### 3. Data Quality and Business Logic
 
-The pipeline applies data quality rules and workflow-specific transformations before loading the data into MySQL.
+The pipeline applies data quality rules and workflow-specific transformations before loading the data into SQL.
 
 Key features:
 
@@ -99,7 +99,7 @@ These outputs are designed to support downstream analysis, programme monitoring,
 
 ### 5. Database Loading
 
-Processed datasets are inserted into MySQL using batch operations and upsert logic.
+Processed datasets are inserted into SQL using batch operations and upsert logic.
 
 Key features:
 
@@ -132,7 +132,7 @@ This repository is an anonymized portfolio sample.
 4. Normalize and harmonize fields across source datasets.
 5. Apply cleaning, validation, deduplication, and derived calculations.
 6. Create structured output tables by workflow domain.
-7. Load cleaned records into MySQL using batch upsert operations.
+7. Load cleaned records into SQL using batch upsert operations.
 8. Make the database available for reporting, dashboards, and monitoring analysis.
 
 ---
@@ -172,7 +172,7 @@ This project demonstrates practical skills relevant to information management an
 3. Create a `.env` file using `.env.example`.
 4. Add approved API/database credentials locally.
 5. Run the ETL script.
-6. Review processed records in the MySQL database.
+6. Review processed records in the SQL database.
 
 > Note: This repository is intended as a portfolio demonstration. It uses anonymized field names and mock configuration placeholders.
 
