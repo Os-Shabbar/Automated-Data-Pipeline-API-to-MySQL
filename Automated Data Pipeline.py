@@ -1,5 +1,5 @@
 """
-Portfolio Sample: Anonymized KoboToolbox-to-SQL ETL Pipeline
+Portfolio Sample: Anonymized KoboToolbox-to-SQL Server ETL Pipeline
 Author: Osama Shabbar
 
 Purpose
@@ -9,7 +9,7 @@ This script demonstrates an ETL workflow for humanitarian programme monitoring d
 2. Standardize and harmonize inconsistent field structures across forms.
 3. Apply data quality checks, deduplication, date parsing, and numeric conversions.
 4. Protect sensitive fields through hashing and location approximation.
-5. Load cleaned analytical tables into SQL using batch upserts.
+5. Load cleaned analytical tables into SQL Server using batch upserts.
 
 Confidentiality Note
 --------------------
@@ -73,7 +73,23 @@ def get_required_env(name: str) -> str:
 
 
 def load_config() -> Dict[str, object]:
-   
+    """Load configuration from environment variables.
+
+    Required environment variables:
+        KOBO_BASE_URL          Example: https://kf.kobotoolbox.org/api/v2/assets/
+        KOBO_API_TOKEN         Kobo API token
+        KOBO_PROJECT_UID_1     Kobo form asset UID for modality/source 1
+        KOBO_PROJECT_UID_2     Kobo form asset UID for modality/source 2
+        KOBO_PROJECT_UID_3     Kobo form asset UID for update/source 3
+
+    Required only when LOAD_TO_SQLSERVER=true:
+        SQLSERVER_HOST
+        SQLSERVER_USER
+        SQLSERVER_PASSWORD
+        SQLSERVER_DB
+        SQLSERVER_PORT
+        SQLSERVER_DRIVER
+    """
 
     project_uids = [
         os.getenv("KOBO_PROJECT_UID_1"),
@@ -92,19 +108,19 @@ def load_config() -> Dict[str, object]:
     }
 
     if LOAD_TO_SQLSERVER:
-    config.update(
-        {
-            "sqlserver_host": get_required_env("SQLSERVER_HOST"),
-            "sqlserver_port": os.getenv("SQLSERVER_PORT", "1433"),
-            "sqlserver_user": get_required_env("SQLSERVER_USER"),
-            "sqlserver_password": get_required_env("SQLSERVER_PASSWORD"),
-            "sqlserver_db": get_required_env("SQLSERVER_DB"),
-            "sqlserver_driver": os.getenv(
-                "SQLSERVER_DRIVER",
-                "ODBC Driver 18 for SQL Server",
-            ),
-        }
-    )
+        config.update(
+            {
+                "sqlserver_host": get_required_env("SQLSERVER_HOST"),
+                "sqlserver_port": os.getenv("SQLSERVER_PORT", "1433"),
+                "sqlserver_user": get_required_env("SQLSERVER_USER"),
+                "sqlserver_password": get_required_env("SQLSERVER_PASSWORD"),
+                "sqlserver_db": get_required_env("SQLSERVER_DB"),
+                "sqlserver_driver": os.getenv(
+                    "SQLSERVER_DRIVER",
+                    "ODBC Driver 18 for SQL Server",
+                ),
+            }
+        )
 
     return config
 
@@ -746,29 +762,86 @@ def clean_value(value: object) -> object:
     return value
 
 
-def get_mysql_connection(config: Dict[str, object]) -> pymysql.connections.Connection:
-    """Create MySQL connection."""
+def quote_sqlserver_identifier(identifier: str) -> str:
+    """Safely quote a SQL Server identifier such as a table or column name."""
 
-    return pymysql.connect(
-        host=config["mysql_host"],
-        user=config["mysql_user"],
-        password=config["mysql_password"],
-        database=config["mysql_db"],
-        charset="utf8mb4",
-        autocommit=False,
+    return f"[{str(identifier).replace(']', ']]')}]"
+
+
+def quote_sqlserver_table_name(table_name: str) -> str:
+    """Quote table names, including optional schema names like dbo.table_name."""
+
+    return ".".join(quote_sqlserver_identifier(part) for part in str(table_name).split("."))
+
+
+def get_sqlserver_connection(config: Dict[str, object]) -> pyodbc.Connection:
+    """Create SQL Server connection using pyodbc."""
+
+    connection_string = (
+        f"DRIVER={{{config['sqlserver_driver']}}};"
+        f"SERVER={config['sqlserver_host']},{config['sqlserver_port']};"
+        f"DATABASE={config['sqlserver_db']};"
+        f"UID={config['sqlserver_user']};"
+        f"PWD={config['sqlserver_password']};"
+        "Encrypt=yes;"
+        "TrustServerCertificate=yes;"
     )
+
+    return pyodbc.connect(connection_string, autocommit=False)
+
+
+def build_sqlserver_merge_query(
+    table_name: str,
+    columns: List[str],
+    key_columns: List[str],
+) -> str:
+    """Build a SQL Server MERGE statement for one-row parameterized upserts."""
+
+    missing_keys = [col for col in key_columns if col not in columns]
+    if missing_keys:
+        raise ValueError(f"Missing key columns for upsert into {table_name}: {missing_keys}")
+
+    update_columns = [col for col in columns if col not in key_columns]
+
+    table_sql = quote_sqlserver_table_name(table_name)
+    source_sql = ", ".join(f"? AS {quote_sqlserver_identifier(col)}" for col in columns)
+    match_sql = " AND ".join(
+        f"target.{quote_sqlserver_identifier(col)} = source.{quote_sqlserver_identifier(col)}"
+        for col in key_columns
+    )
+    insert_columns_sql = ", ".join(quote_sqlserver_identifier(col) for col in columns)
+    insert_values_sql = ", ".join(f"source.{quote_sqlserver_identifier(col)}" for col in columns)
+
+    if update_columns:
+        update_sql = ", ".join(
+            f"target.{quote_sqlserver_identifier(col)} = source.{quote_sqlserver_identifier(col)}"
+            for col in update_columns
+        )
+        matched_clause = f"WHEN MATCHED THEN UPDATE SET {update_sql}"
+    else:
+        matched_clause = ""
+
+    return f"""
+        MERGE INTO {table_sql} WITH (HOLDLOCK) AS target
+        USING (SELECT {source_sql}) AS source
+        ON {match_sql}
+        {matched_clause}
+        WHEN NOT MATCHED THEN
+            INSERT ({insert_columns_sql})
+            VALUES ({insert_values_sql});
+    """
 
 
 def upsert_dataframe(
-    connection: pymysql.connections.Connection,
+    connection: pyodbc.Connection,
     table_name: str,
     df: pd.DataFrame,
     key_columns: List[str],
 ) -> int:
-    """Batch upsert a dataframe into MySQL.
+    """Batch upsert a dataframe into SQL Server.
 
-    Assumption: target tables already exist and have a UNIQUE KEY or PRIMARY KEY
-    matching key_columns, usually case_id for these portfolio tables.
+    Assumption: target tables already exist and have a PRIMARY KEY or UNIQUE
+    constraint matching key_columns, usually case_id for these portfolio tables.
     """
 
     if df.empty:
@@ -777,39 +850,23 @@ def upsert_dataframe(
 
     df = df.copy().replace({np.nan: None, np.inf: None, -np.inf: None})
     columns = list(df.columns)
-    update_columns = [col for col in columns if col not in key_columns]
-
-    column_sql = ", ".join(f"`{col}`" for col in columns)
-    placeholder_sql = ", ".join(["%s"] * len(columns))
-    update_sql = ", ".join(f"`{col}` = VALUES(`{col}`)" for col in update_columns)
-
-    if update_sql:
-        query = f"""
-            INSERT INTO `{table_name}` ({column_sql})
-            VALUES ({placeholder_sql})
-            ON DUPLICATE KEY UPDATE {update_sql}
-        """
-    else:
-        query = f"""
-            INSERT IGNORE INTO `{table_name}` ({column_sql})
-            VALUES ({placeholder_sql})
-        """
-
+    query = build_sqlserver_merge_query(table_name, columns, key_columns)
     values = [tuple(clean_value(row[col]) for col in columns) for _, row in df.iterrows()]
 
     with connection.cursor() as cursor:
+        cursor.fast_executemany = True
         cursor.executemany(query, values)
 
     logger.info("Upserted %s records into %s", len(values), table_name)
     return len(values)
 
 
-def load_outputs_to_mysql(config: Dict[str, object], outputs: Dict[str, pd.DataFrame]) -> None:
-    """Load all output tables into MySQL in one transaction."""
+def load_outputs_to_sqlserver(config: Dict[str, object], outputs: Dict[str, pd.DataFrame]) -> None:
+    """Load all output tables into SQL Server in one transaction."""
 
-    connection: Optional[pymysql.connections.Connection] = None
+    connection: Optional[pyodbc.Connection] = None
     try:
-        connection = get_mysql_connection(config)
+        connection = get_sqlserver_connection(config)
 
         for table_name, df in outputs.items():
             upsert_dataframe(connection, table_name, df, key_columns=["case_id"])
@@ -817,8 +874,8 @@ def load_outputs_to_mysql(config: Dict[str, object], outputs: Dict[str, pd.DataF
         connection.commit()
         logger.info("All outputs committed successfully.")
 
-    except pymysql.MySQLError as exc:
-        logger.error("MySQL error: %s", exc)
+    except pyodbc.Error as exc:
+        logger.error("SQL Server error: %s", exc)
         if connection:
             connection.rollback()
             logger.info("Transaction rolled back.")
@@ -844,7 +901,7 @@ def load_outputs_to_mysql(config: Dict[str, object], outputs: Dict[str, pd.DataF
 
 def main() -> None:
     logger.info("=" * 70)
-    logger.info("ANONYMIZED KOBO TO MYSQL ETL PIPELINE")
+    logger.info("ANONYMIZED KOBO TO SQL SERVER ETL PIPELINE")
     logger.info("=" * 70)
 
     config = load_config()
@@ -852,10 +909,10 @@ def main() -> None:
     outputs = transform_data(source_frames)
     run_quality_checks(outputs)
 
-    if LOAD_TO_MYSQL:
-        load_outputs_to_mysql(config, outputs)
+    if LOAD_TO_SQLSERVER:
+        load_outputs_to_sqlserver(config, outputs)
     else:
-        logger.info("LOAD_TO_MYSQL=false; skipping database load step.")
+        logger.info("LOAD_TO_SQLSERVER=false; skipping database load step.")
 
     logger.info("ETL sync complete.")
 
